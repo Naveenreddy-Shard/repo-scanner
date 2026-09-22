@@ -1,0 +1,79 @@
+name: Scan a repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "GitHub link of the repo to scan (https://github.com/owner/name)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REPO_URL: ${{ inputs.repo_url }}
+      SKILLSPECTOR_VERSION: v2.11.2
+    steps:
+      - name: Check the link is a plain GitHub repo URL
+        run: |
+          if [[ ! "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$ ]]; then
+            echo "::error::That is not a plain GitHub repo link (https://github.com/owner/name)"
+            exit 2
+          fi
+
+      - name: Download the repo (no submodules, no symlinks, nothing run)
+        run: |
+          git -c core.symlinks=false clone --depth 1 --no-recurse-submodules "$REPO_URL" target
+          echo "SCANNED_COMMIT=$(git -C target rev-parse HEAD)" >> "$GITHUB_ENV"
+          rm -rf target/.git
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install SkillSpector (pinned version)
+        run: pip install "skillspector @ git+https://github.com/NVIDIA/SkillSpector.git@${SKILLSPECTOR_VERSION}"
+
+      - name: Scan (static only, nothing sent to any AI service)
+        run: |
+          set +e
+          skillspector scan target --no-llm --format markdown --output report.md
+          CODE=$?
+          skillspector scan target --no-llm --format json --output report.json
+          skillspector scan target --no-llm --format sarif --output report.sarif
+          echo "SCAN_EXIT=$CODE" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Write the summary
+        if: always()
+        run: |
+          {
+            echo "## SkillSpector scan"
+            echo "- Repo: $REPO_URL"
+            echo "- Commit scanned: ${SCANNED_COMMIT:-unknown}"
+            echo "- SkillSpector: $SKILLSPECTOR_VERSION (--no-llm)"
+            echo "- Exit code: ${SCAN_EXIT:-not run} (0 = low risk, 1 = findings, 2 = error)"
+            echo
+            [ -f report.md ] && cat report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: skillspector-report
+          path: |
+            report.md
+            report.json
+            report.sarif
+          retention-days: 30
+
+      - name: Verdict
+        run: |
+          if [ "${SCAN_EXIT}" = "0" ]; then echo "Low risk. Friday still reviews before any download."; exit 0; fi
+          if [ "${SCAN_EXIT}" = "1" ]; then echo "::error::Findings. Do NOT download. Send the run link to Friday."; exit 1; fi
+          echo "::error::The scan could not run (exit ${SCAN_EXIT:-missing}). That is not a pass."; exit 2
